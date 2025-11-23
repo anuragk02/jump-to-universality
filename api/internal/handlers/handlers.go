@@ -12,10 +12,10 @@ import (
 
 	"api/internal/database"
 	"api/internal/models"
-	"github.com/golang-jwt/jwt/v5"
-	"golang.org/x/crypto/bcrypt"
 	"github.com/gin-gonic/gin"
-	// "github.com/google/uuid"
+	"github.com/golang-jwt/jwt/v5"
+	"github.com/neo4j/neo4j-go-driver/v5/neo4j"
+	"golang.org/x/crypto/bcrypt"
 )
 
 type Handler struct {
@@ -58,19 +58,11 @@ func (h *Handler) LoginHandler(c *gin.Context) {
 	log.Printf("Login attempt for username: '%s'", req.Username)
 
 	// 2. Fetch the user from the database (Neo4j)
-	// This query IS case-sensitive.
-	query := `MATCH (u:User {username: $username}) 
-              RETURN u.uuid, u.username, u.password`
+	query := `MATCH (u:User {username: $username})
+              RETURN u.username AS username, u.password AS password`
 	params := map[string]interface{}{"username": req.Username}
 
-	// ----
-	// OPTIONAL: If you want case-INSENSITIVE login, use this query instead:
-	// query := `MATCH (u:User) 
-	//           WHERE toLower(u.username) = toLower($username)
-	//           RETURN u.uuid, u.username, u.password`
-	// ----
-
-	records, err := h.db.ExecuteRead(context.Background(), query, params)
+	result, err := neo4j.ExecuteQuery(context.Background(), h.db.Driver, query, params, neo4j.EagerResultTransformer)
 	if err != nil {
 		log.Printf("Database query error in LoginHandler: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Database error"})
@@ -78,19 +70,20 @@ func (h *Handler) LoginHandler(c *gin.Context) {
 	}
 
 	// 3. Check if user was found
-	if len(records) == 0 {
-		// --- DEBUGGING: This is Failure Point 1 ---
-		// This means the query returned 0 rows.
-		// The username in your DB does not match what was sent.
+	if len(result.Records) == 0 {
 		log.Printf("Login failed: User '%s' not found.", req.Username)
 		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid username or password"})
 		return
 	}
 
 	// 4. Populate user from database record
-	record := records[0]
-	user.Username, _ = record["u.username"].(string)
-	user.Password, _ = record["u.password"].(string)
+	record := result.Records[0]
+	if username, ok := record.Get("username"); ok {
+		user.Username = username.(string)
+	}
+	if password, ok := record.Get("password"); ok {
+		user.Password = password.(string)
+	}
 
 	log.Printf("Login: Found user '%s', verifying password...", user.Username)
 	log.Printf("Password lengths. DB hash: %d. Received password: %d.", len(user.Password), len(req.Password))
@@ -192,5 +185,286 @@ func AuthMiddleware() gin.HandlerFunc {
 
 func (h *Handler) GetProfile(c *gin.Context) {
 	// Test handler to verify protected route access
-	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	username, _ := c.Get("username")
+	c.JSON(http.StatusOK, gin.H{
+		"status":   "ok",
+		"username": username,
+	})
+}
+
+// Essay Handlers
+
+// CreateEssay creates a new essay
+func (h *Handler) CreateEssay(c *gin.Context) {
+	var req models.CreateEssayRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+		return
+	}
+
+	// Get username from auth middleware
+	username, exists := c.Get("username")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	// Create essay in Neo4j
+	query := `
+		MATCH (u:User {username: $username})
+		CREATE (e:Essay {
+			uuid: randomUUID(),
+			title: $title,
+			content: $content,
+			createdAt: datetime(),
+			updatedAt: datetime()
+		})
+		CREATE (u)-[:AUTHORED]->(e)
+		RETURN e.uuid AS uuid, e.title AS title, e.content AS content,
+		       e.createdAt AS createdAt, e.updatedAt AS updatedAt
+	`
+	params := map[string]interface{}{
+		"username": username.(string),
+		"title":    req.Title,
+		"content":  req.Content,
+	}
+
+	result, err := neo4j.ExecuteQuery(context.Background(), h.db.Driver, query, params, neo4j.EagerResultTransformer)
+	if err != nil {
+		log.Printf("Database error creating essay: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create essay"})
+		return
+	}
+
+	if len(result.Records) == 0 {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to create essay"})
+		return
+	}
+
+	record := result.Records[0]
+	essay := models.EssayResponse{}
+	if uuid, ok := record.Get("uuid"); ok {
+		essay.UUID = uuid.(string)
+	}
+	if title, ok := record.Get("title"); ok {
+		essay.Title = title.(string)
+	}
+	if content, ok := record.Get("content"); ok {
+		essay.Content = content.(string)
+	}
+	if createdAt, ok := record.Get("createdAt"); ok {
+		essay.CreatedAt = createdAt.(time.Time)
+	}
+	if updatedAt, ok := record.Get("updatedAt"); ok {
+		essay.UpdatedAt = updatedAt.(time.Time)
+	}
+
+	c.JSON(http.StatusCreated, essay)
+}
+
+// GetEssay retrieves an essay by UUID
+func (h *Handler) GetEssay(c *gin.Context) {
+	essayUUID := c.Param("uuid")
+
+	query := `
+		MATCH (u:User)-[:AUTHORED]->(e:Essay {uuid: $uuid})
+		RETURN e.uuid AS uuid, e.title AS title, e.content AS content,
+		       e.createdAt AS createdAt, e.updatedAt AS updatedAt
+	`
+	params := map[string]interface{}{"uuid": essayUUID}
+
+	result, err := neo4j.ExecuteQuery(context.Background(), h.db.Driver, query, params, neo4j.EagerResultTransformer)
+	if err != nil {
+		log.Printf("Database error fetching essay: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch essay"})
+		return
+	}
+
+	if len(result.Records) == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Essay not found"})
+		return
+	}
+
+	record := result.Records[0]
+	essay := models.EssayResponse{}
+	if uuid, ok := record.Get("uuid"); ok {
+		essay.UUID = uuid.(string)
+	}
+	if title, ok := record.Get("title"); ok {
+		essay.Title = title.(string)
+	}
+	if content, ok := record.Get("content"); ok {
+		essay.Content = content.(string)
+	}
+	if createdAt, ok := record.Get("createdAt"); ok {
+		essay.CreatedAt = createdAt.(time.Time)
+	}
+	if updatedAt, ok := record.Get("updatedAt"); ok {
+		essay.UpdatedAt = updatedAt.(time.Time)
+	}
+
+	c.JSON(http.StatusOK, essay)
+}
+
+// ListEssays retrieves all essays for the authenticated user
+func (h *Handler) ListEssays(c *gin.Context) {
+	username, exists := c.Get("username")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	query := `
+		MATCH (u:User {username: $username})-[:AUTHORED]->(e:Essay)
+		RETURN e.uuid AS uuid, e.title AS title, e.content AS content,
+		       e.createdAt AS createdAt, e.updatedAt AS updatedAt
+		ORDER BY e.createdAt DESC
+	`
+	params := map[string]interface{}{"username": username.(string)}
+
+	result, err := neo4j.ExecuteQuery(context.Background(), h.db.Driver, query, params, neo4j.EagerResultTransformer)
+	if err != nil {
+		log.Printf("Database error listing essays: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to list essays"})
+		return
+	}
+
+	essays := []models.EssayResponse{}
+	for _, record := range result.Records {
+		essay := models.EssayResponse{}
+		if uuid, ok := record.Get("uuid"); ok {
+			essay.UUID = uuid.(string)
+		}
+		if title, ok := record.Get("title"); ok {
+			essay.Title = title.(string)
+		}
+		if content, ok := record.Get("content"); ok {
+			essay.Content = content.(string)
+		}
+		if createdAt, ok := record.Get("createdAt"); ok {
+			essay.CreatedAt = createdAt.(time.Time)
+		}
+		if updatedAt, ok := record.Get("updatedAt"); ok {
+			essay.UpdatedAt = updatedAt.(time.Time)
+		}
+		essays = append(essays, essay)
+	}
+
+	c.JSON(http.StatusOK, essays)
+}
+
+// UpdateEssay updates an existing essay
+func (h *Handler) UpdateEssay(c *gin.Context) {
+	essayUUID := c.Param("uuid")
+	username, exists := c.Get("username")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	var req models.UpdateEssayRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid request body"})
+		return
+	}
+
+	// Validate that at least one field is being updated
+	if req.Title == "" && req.Content == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "At least one field (title or content) must be provided for update"})
+		return
+	}
+
+	// Build dynamic SET clause
+	setClauses := []string{"e.updatedAt = datetime()"}
+	params := map[string]interface{}{
+		"uuid":     essayUUID,
+		"username": username.(string),
+	}
+
+	if req.Title != "" {
+		setClauses = append(setClauses, "e.title = $title")
+		params["title"] = req.Title
+	}
+	if req.Content != "" {
+		setClauses = append(setClauses, "e.content = $content")
+		params["content"] = req.Content
+	}
+
+	query := fmt.Sprintf(`
+		MATCH (u:User {username: $username})-[:AUTHORED]->(e:Essay {uuid: $uuid})
+		SET %s
+		RETURN e.uuid AS uuid, e.title AS title, e.content AS content,
+		       e.createdAt AS createdAt, e.updatedAt AS updatedAt
+	`, strings.Join(setClauses, ", "))
+
+	result, err := neo4j.ExecuteQuery(context.Background(), h.db.Driver, query, params, neo4j.EagerResultTransformer)
+	if err != nil {
+		log.Printf("Database error updating essay: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to update essay"})
+		return
+	}
+
+	if len(result.Records) == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Essay not found or you don't have permission"})
+		return
+	}
+
+	record := result.Records[0]
+	essay := models.EssayResponse{}
+	if uuid, ok := record.Get("uuid"); ok {
+		essay.UUID = uuid.(string)
+	}
+	if title, ok := record.Get("title"); ok {
+		essay.Title = title.(string)
+	}
+	if content, ok := record.Get("content"); ok {
+		essay.Content = content.(string)
+	}
+	if createdAt, ok := record.Get("createdAt"); ok {
+		essay.CreatedAt = createdAt.(time.Time)
+	}
+	if updatedAt, ok := record.Get("updatedAt"); ok {
+		essay.UpdatedAt = updatedAt.(time.Time)
+	}
+
+	c.JSON(http.StatusOK, essay)
+}
+
+// DeleteEssay deletes an essay
+func (h *Handler) DeleteEssay(c *gin.Context) {
+	essayUUID := c.Param("uuid")
+	username, exists := c.Get("username")
+	if !exists {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Unauthorized"})
+		return
+	}
+
+	query := `
+		MATCH (u:User {username: $username})-[r:AUTHORED]->(e:Essay {uuid: $uuid})
+		DELETE r, e
+		RETURN count(e) AS deleted
+	`
+	params := map[string]interface{}{
+		"uuid":     essayUUID,
+		"username": username.(string),
+	}
+
+	result, err := neo4j.ExecuteQuery(context.Background(), h.db.Driver, query, params, neo4j.EagerResultTransformer)
+	if err != nil {
+		log.Printf("Database error deleting essay: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to delete essay"})
+		return
+	}
+
+	if len(result.Records) == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Essay not found or you don't have permission"})
+		return
+	}
+
+	record := result.Records[0]
+	if deleted, ok := record.Get("deleted"); ok && deleted.(int64) > 0 {
+		c.JSON(http.StatusOK, gin.H{"message": "Essay deleted successfully"})
+	} else {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Essay not found or you don't have permission"})
+	}
 }
